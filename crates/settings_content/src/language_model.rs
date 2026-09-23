@@ -402,10 +402,25 @@ impl MergeFrom for OpenAiReasoningEffort {
     }
 }
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiCompatibleAutoDiscoverMode {
+    #[default]
+    None,
+    LiteLlm,
+}
+
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
 pub struct OpenAiCompatibleSettingsContent {
     pub api_url: String,
+    /// Whether to automatically discover models from the provider's `/v1/models`
+    /// endpoint. Defaults to false. When enabled, discovered models are merged
+    /// with `available_models` (manual entries override by name).
+    pub auto_discover: Option<bool>,
+    /// When auto-discover is enabled, optionally fetch capability/token data
+    /// from a provider-specific endpoint. Defaults to `none` (names only).
+    pub auto_discover_mode: Option<OpenAiCompatibleAutoDiscoverMode>,
     pub available_models: Vec<OpenAiCompatibleAvailableModel>,
     pub custom_headers: Option<HashMap<String, String>>,
 }

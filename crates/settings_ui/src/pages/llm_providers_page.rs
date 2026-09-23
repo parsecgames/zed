@@ -9,8 +9,9 @@ use language_model::{
 
 use settings::{
     AnthropicCompatibleAvailableModel, AnthropicCompatibleModelCapabilities,
-    AnthropicCompatibleSettingsContent, OpenAiCompatibleAvailableModel,
-    OpenAiCompatibleModelCapabilities, OpenAiCompatibleSettingsContent, OpenAiReasoningEffort,
+    AnthropicCompatibleSettingsContent, OpenAiCompatibleAutoDiscoverMode,
+    OpenAiCompatibleAvailableModel, OpenAiCompatibleModelCapabilities,
+    OpenAiCompatibleSettingsContent, OpenAiReasoningEffort,
 };
 use ui::{
     ButtonLink, Checkbox, ConfiguredApiCard, ContextMenu, Divider, DividerColor, DropdownMenu,
@@ -526,6 +527,8 @@ pub(crate) struct LlmProviderForm {
     provider_name: Entity<Editor>,
     api_url: Entity<Editor>,
     api_key: Entity<Editor>,
+    auto_discover: ToggleState,
+    auto_discover_mode: OpenAiCompatibleAutoDiscoverMode,
     models: Vec<ModelInput>,
     error: Option<SharedString>,
 }
@@ -547,6 +550,8 @@ impl LlmProviderForm {
                 window,
                 cx,
             ),
+            auto_discover: ToggleState::Unselected,
+            auto_discover_mode: OpenAiCompatibleAutoDiscoverMode::default(),
             models: vec![ModelInput::new(0, window, cx)],
             error: None,
         }
@@ -691,6 +696,45 @@ fn render_llm_provider_form_page(
                     &form.api_key,
                     cx,
                 ))
+                .when(matches!(form.kind, CompatibleProviderKind::OpenAi), |this| {
+                    this.child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Checkbox::new("auto-discover", form.auto_discover)
+                                    .label("Auto-discover models")
+                                    .on_click(cx.listener(
+                                        |this, checked, _window, cx| {
+                                            if let Some(form) = this.llm_provider_form.as_mut() {
+                                                form.auto_discover = *checked;
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
+                            )
+                            .child(
+                                Label::new("Fetch the provider's model list from its /v1/models endpoint and merge with any manually-added models below.")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .when(form.auto_discover.selected(), |this| {
+                                this.child(
+                                    h_flex()
+                                        .w_full()
+                                        .justify_between()
+                                        .child(
+                                            Label::new("Auto-discover mode")
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(render_auto_discover_mode_selector(
+                                            form.auto_discover_mode,
+                                            window,
+                                            cx,
+                                        )),
+                                )
+                            }),
+                    )
+                })
                 .child(render_models_section(form, window, cx)),
         )
         .child(
@@ -830,27 +874,30 @@ fn render_model(
             cx,
         ))
         .child(render_model_capabilities(kind, model, index, window, cx))
-        .when(model_count > 1, |this| {
-            this.child(
-                Button::new(("remove-model", index), "Remove Model")
-                    .start_icon(
-                        Icon::new(IconName::Trash)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Outlined)
-                    .full_width()
-                    .on_click(cx.listener(move |this, _, _window, cx| {
-                        if let Some(form) = this.llm_provider_form.as_mut()
-                            && index < form.models.len()
-                        {
-                            form.models.remove(index);
-                        }
-                        cx.notify();
-                    })),
-            )
-        })
+        .when(
+            matches!(kind, CompatibleProviderKind::OpenAi) || model_count > 1,
+            |this| {
+                this.child(
+                    Button::new(("remove-model", index), "Remove Model")
+                        .start_icon(
+                            Icon::new(IconName::Trash)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Outlined)
+                        .full_width()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            if let Some(form) = this.llm_provider_form.as_mut()
+                                && index < form.models.len()
+                            {
+                                form.models.remove(index);
+                            }
+                            cx.notify();
+                        })),
+                )
+            },
+        )
         .into_any_element()
 }
 
@@ -1010,6 +1057,53 @@ fn render_reasoning_effort_selector(
         )
 }
 
+fn render_auto_discover_mode_selector(
+    selected: OpenAiCompatibleAutoDiscoverMode,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) -> impl IntoElement {
+    let settings_window = cx.weak_entity();
+    let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+        for option in [
+            (OpenAiCompatibleAutoDiscoverMode::None, "Default"),
+            (OpenAiCompatibleAutoDiscoverMode::LiteLlm, "LiteLLM"),
+        ] {
+            let (mode, label) = option;
+            let is_selected = mode == selected;
+            let settings_window = settings_window.clone();
+            menu.push_item(
+                ui::ContextMenuEntry::new(label)
+                    .toggleable(IconPosition::End, is_selected)
+                    .handler(move |_window, cx| {
+                        settings_window
+                            .update(cx, |this, cx| {
+                                if let Some(form) = this.llm_provider_form.as_mut() {
+                                    form.auto_discover_mode = mode;
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    }),
+            );
+        }
+        menu
+    });
+
+    let label = match selected {
+        OpenAiCompatibleAutoDiscoverMode::None => "Default",
+        OpenAiCompatibleAutoDiscoverMode::LiteLlm => "LiteLLM",
+    };
+
+    DropdownMenu::new(
+        ElementId::Name("auto-discover-mode-selector".into()),
+        label,
+        menu,
+    )
+    .style(DropdownStyle::Outlined)
+    .trigger_size(ButtonSize::Compact)
+    .aria_label("Auto-discover mode")
+}
+
 fn render_form_error(error: SharedString) -> impl IntoElement {
     h_flex()
         .w_full()
@@ -1049,6 +1143,8 @@ struct LlmProviderFormValues {
     provider_name: String,
     api_url: String,
     api_key: String,
+    auto_discover: bool,
+    auto_discover_mode: OpenAiCompatibleAutoDiscoverMode,
     models: Vec<ModelValues>,
 }
 
@@ -1087,6 +1183,8 @@ fn save_llm_provider_form(
             provider_name: form.provider_name.read(cx).text(cx),
             api_url: form.api_url.read(cx).text(cx),
             api_key: form.api_key.read(cx).text(cx),
+            auto_discover: form.auto_discover.selected(),
+            auto_discover_mode: form.auto_discover_mode,
             models: form
                 .models
                 .iter()
@@ -1120,6 +1218,9 @@ fn save_llm_provider_form(
         }
     };
 
+    let auto_discover = values.auto_discover;
+    let auto_discover_mode = values.auto_discover_mode;
+
     let fs = <dyn fs::Fs>::global(cx);
     cx.spawn_in(window, async move |this, cx| {
         let result = async {
@@ -1136,6 +1237,10 @@ fn save_llm_provider_form(
                                     Arc::from(provider_name.as_str()),
                                     OpenAiCompatibleSettingsContent {
                                         api_url: api_url.clone(),
+                                        auto_discover: auto_discover.then_some(true),
+                                        auto_discover_mode: auto_discover.then_some(
+                                            auto_discover_mode,
+                                        ),
                                         available_models,
                                         custom_headers: None,
                                     },
@@ -1224,6 +1329,18 @@ fn validate_llm_provider_form(
     let api_key = values.api_key.clone();
     if api_key.is_empty() {
         return Err("API Key cannot be empty".into());
+    }
+
+    // Auto-discover can stand in for manual models on OpenAI-compatible
+    // providers, but Anthropic-compatible providers always need at least one.
+    if values.models.is_empty() {
+        let requires_manual_model = match values.kind {
+            CompatibleProviderKind::OpenAi => !values.auto_discover,
+            CompatibleProviderKind::Anthropic => true,
+        };
+        if requires_manual_model {
+            return Err("Add at least one model".into());
+        }
     }
 
     let models = match values.kind {

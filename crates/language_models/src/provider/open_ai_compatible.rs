@@ -1,8 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{App, AppContext, AsyncApp, Entity, Task};
-use http_client::{CustomHeaders, HttpClient};
+use futures::{AsyncReadExt, FutureExt, StreamExt, future::BoxFuture};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, Task, TaskExt, Window};
+use http_client::{
+    AsyncBody, CustomHeaders, HttpClient, HttpRequestExt, Method, Request as HttpRequest,
+    RequestBuilderExt,
+};
 use language_model::chat_completion::ChatCompletionEventMapper;
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelCompletionError,
@@ -16,23 +20,31 @@ use open_ai::{
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
     stream_completion,
 };
+use serde::Deserialize;
 use settings::Settings;
 use std::sync::Arc;
-use ui::IconName;
+use ui::{ButtonLike, ElevationIndex, IconButton, IconName, Tooltip, prelude::*};
+use ui_input::InputField;
 
-use crate::provider::api_compatible::{
-    ApiCompatibleProviderConfigurationView, ApiCompatibleProviderSettings,
-    ApiCompatibleProviderState,
-};
+use crate::provider::api_compatible::{ApiCompatibleProviderSettings, ApiCompatibleProviderState};
 use crate::provider::open_ai::{OpenAiResponseEventMapper, into_open_ai, into_open_ai_response};
+pub use settings::OpenAiCompatibleAutoDiscoverMode as AutoDiscoverMode;
 pub use settings::OpenAiCompatibleAvailableModel as AvailableModel;
 pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
+pub use settings::OpenAiReasoningEffort;
 
 const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000000000";
+
+// Context window size applied to auto-discovered models, since the standard
+// /v1/models response doesn't include token limits. Users can override
+// per-model via `available_models` in settings.
+const DEFAULT_MAX_TOKENS: u64 = 128_000;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
     pub api_url: String,
+    pub auto_discover: bool,
+    pub auto_discover_mode: AutoDiscoverMode,
     pub available_models: Vec<AvailableModel>,
     pub custom_headers: CustomHeaders,
 }
@@ -45,11 +57,94 @@ impl ApiCompatibleProviderSettings for OpenAiCompatibleSettings {
 
 pub type State = ApiCompatibleProviderState<OpenAiCompatibleSettings>;
 
+/// Holds auto-discovered models and the background fetch task.
+/// Separate from `ApiCompatibleProviderState` (which is generic and shared
+/// with Anthropic-compatible) so the fetch logic stays OpenAI-specific.
+#[derive(Default)]
+pub struct FetchState {
+    fetched_models: Vec<AvailableModel>,
+    fetch_model_task: Option<Task<()>>,
+}
+
+impl FetchState {
+    fn has_models(&self) -> bool {
+        !self.fetched_models.is_empty()
+    }
+
+    pub(crate) fn refresh(
+        &mut self,
+        id: &Arc<str>,
+        http_client: &Arc<dyn HttpClient>,
+        state: &Entity<State>,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = state.read(cx).settings.clone();
+        self.refresh_fetch(id, http_client, state, &settings, cx);
+    }
+
+    fn refresh_fetch(
+        &mut self,
+        id: &Arc<str>,
+        http_client: &Arc<dyn HttpClient>,
+        state: &Entity<State>,
+        settings: &OpenAiCompatibleSettings,
+        cx: &mut Context<Self>,
+    ) {
+        // Cancel any in-flight fetch
+        self.fetch_model_task = None;
+
+        if !settings.auto_discover {
+            self.fetched_models.clear();
+            cx.notify();
+            return;
+        }
+
+        self.fetched_models.clear();
+        cx.notify();
+
+        let id = id.clone();
+        let http_client = http_client.clone();
+        let state = state.clone();
+        let api_url = settings.api_url.clone();
+        let extra_headers = settings.custom_headers.clone();
+        let auto_discover_mode = settings.auto_discover_mode;
+
+        self.fetch_model_task = Some(cx.spawn(async move |this, cx| {
+            let api_key = state.read_with(cx, |state, _cx| state.api_key_state.key(&api_url));
+            let result = fetch_models(
+                http_client.as_ref(),
+                &api_url,
+                api_key.as_deref(),
+                &extra_headers,
+                auto_discover_mode,
+            )
+            .await;
+
+            match result {
+                Ok(models) => {
+                    this.update(cx, |this, cx| {
+                        this.fetched_models = models;
+                        cx.notify();
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    log::info!(
+                        "Failed to fetch models for OpenAI-compatible provider {id}: {error}"
+                    );
+                    // Keep existing fetched models on failure (graceful degradation)
+                }
+            }
+        }));
+    }
+}
+
 pub struct OpenAiCompatibleLanguageModelProvider {
     id: LanguageModelProviderId,
     name: LanguageModelProviderName,
     http_client: Arc<dyn HttpClient>,
     state: Entity<State>,
+    fetch_state: Entity<FetchState>,
 }
 
 impl OpenAiCompatibleLanguageModelProvider {
@@ -61,7 +156,7 @@ impl OpenAiCompatibleLanguageModelProvider {
     ) -> Self {
         let state = State::new(
             id.clone(),
-            credentials_provider,
+            credentials_provider.clone(),
             |id, cx| {
                 crate::AllLanguageModelSettings::get_global(cx)
                     .openai_compatible
@@ -70,11 +165,34 @@ impl OpenAiCompatibleLanguageModelProvider {
             cx,
         );
 
+        let fetch_state = cx.new(|cx| {
+            let observe_id = id.clone();
+            let observe_http_client = http_client.clone();
+            let observe_state = state.clone();
+            cx.observe(&state, move |this: &mut FetchState, _state, cx| {
+                let settings = observe_state.read(cx).settings.clone();
+                this.refresh_fetch(
+                    &observe_id,
+                    &observe_http_client,
+                    &observe_state,
+                    &settings,
+                    cx,
+                );
+            })
+            .detach();
+
+            let mut fetch_state = FetchState::default();
+            let settings = state.read(cx).settings.clone();
+            fetch_state.refresh_fetch(&id, &http_client, &state, &settings, cx);
+            fetch_state
+        });
+
         Self {
             id: id.clone().into(),
             name: id.into(),
             http_client,
             state,
+            fetch_state,
         }
     }
 
@@ -89,13 +207,209 @@ impl OpenAiCompatibleLanguageModelProvider {
             request_limiter: RateLimiter::new(4),
         })
     }
+
+    /// Merge auto-discovered models with manual `available_models`.
+    /// Manual entries override auto-discovered entries by name.
+    fn merged_models(&self, cx: &App) -> Vec<AvailableModel> {
+        let manual = &self.state.read(cx).settings.available_models;
+        let fetched = &self.fetch_state.read(cx).fetched_models;
+
+        if fetched.is_empty() {
+            return manual.clone();
+        }
+
+        let mut merged: BTreeMap<String, AvailableModel> = BTreeMap::default();
+
+        // Auto-discovered models first
+        for model in fetched {
+            merged.insert(model.name.clone(), model.clone());
+        }
+
+        // Manual overrides take precedence
+        for model in manual {
+            merged.insert(model.name.clone(), model.clone());
+        }
+
+        merged.into_values().collect()
+    }
+}
+
+// ── Auto-discovery: fetch models from /v1/models ──────────────────────────
+
+/// Response of `GET /v1/models` (standard OpenAI format).
+#[derive(Deserialize)]
+struct ListModelsResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+// ── Model info: LiteLLM /model/info ────────────────────────────────────────
+
+/// Response of LiteLLM's `GET /v1/model/info` endpoint.
+#[derive(Deserialize)]
+struct LiteLlmModelInfoResponse {
+    #[serde(default)]
+    data: Vec<LiteLlmModelInfoEntry>,
+}
+
+#[derive(Deserialize)]
+struct LiteLlmModelInfoEntry {
+    model_name: String,
+    #[serde(default)]
+    model_info: LiteLlmModelInfo,
+}
+
+#[derive(Default, Deserialize)]
+struct LiteLlmModelInfo {
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    supports_function_calling: Option<bool>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
+    #[serde(default)]
+    supports_reasoning: Option<bool>,
+    #[serde(default)]
+    supports_prompt_caching: Option<bool>,
+}
+
+/// Enrich auto-discovered models with capability/token data from LiteLLM's
+/// `/v1/model/info` response. Pure — no I/O; takes the raw JSON body and
+/// updates models in place. Models without a matching `/model/info` entry
+/// keep their default capabilities.
+fn enrich_models_lite_llm(models: &mut [AvailableModel], model_info_body: &str) {
+    let Ok(response) = serde_json::from_str::<LiteLlmModelInfoResponse>(model_info_body) else {
+        return;
+    };
+    let info: collections::HashMap<&str, &LiteLlmModelInfo> = response
+        .data
+        .iter()
+        .map(|entry| (entry.model_name.as_str(), &entry.model_info))
+        .collect();
+    for model in models.iter_mut() {
+        let Some(info) = info.get(model.name.as_str()) else {
+            continue;
+        };
+        model.max_tokens = info
+            .max_input_tokens
+            .or(info.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+        model.max_output_tokens = info.max_output_tokens.or(info.max_tokens);
+        model.capabilities.tools = info.supports_function_calling.unwrap_or(true);
+        model.capabilities.images = info.supports_vision.unwrap_or(false);
+        model.capabilities.prompt_cache_key = info.supports_prompt_caching.unwrap_or(false);
+        if info.supports_reasoning.unwrap_or(false) {
+            model.reasoning_effort = Some(OpenAiReasoningEffort::Medium);
+        }
+    }
+}
+
+/// Fetch the provider's model list from its `/v1/models` endpoint.
+///
+/// `api_url` already includes the `/v1` prefix (matching the convention used
+/// for `/chat/completions`), so `/models` is appended directly. When
+/// auto-discover mode is set, a second request fetches capability/token data
+/// from a provider-specific endpoint. Discovered models are returned with
+/// default capabilities unless enriched; users can override individual
+/// models via `available_models` in settings.
+async fn fetch_models(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: Option<&str>,
+    extra_headers: &CustomHeaders,
+    auto_discover_mode: AutoDiscoverMode,
+) -> Result<Vec<AvailableModel>> {
+    let models_url = format!("{api_url}/models");
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(&models_url)
+        .header("Accept", "application/json")
+        .when_some(api_key, |builder, key| {
+            builder.header("Authorization", format!("Bearer {key}"))
+        })
+        .extra_headers(extra_headers)
+        .body(AsyncBody::default())?;
+
+    let mut response = client.send(request).await?;
+    let mut body = String::new();
+    response.body_mut().read_to_string(&mut body).await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "Failed to fetch models: {} {}",
+        response.status(),
+        body,
+    );
+    let models_response: ListModelsResponse =
+        serde_json::from_str(&body).context("Unable to parse /v1/models response")?;
+
+    let mut models = Vec::new();
+    for entry in models_response.data {
+        models.push(AvailableModel {
+            name: entry.id.clone(),
+            display_name: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+            capabilities: ModelCapabilities {
+                tools: true,
+                images: false,
+                parallel_tool_calls: false,
+                prompt_cache_key: false,
+                chat_completions: true,
+                interleaved_reasoning: false,
+                max_tokens_parameter: false,
+            },
+        });
+    }
+
+    if auto_discover_mode == AutoDiscoverMode::LiteLlm {
+        let root_url = api_url.strip_suffix("/v1").unwrap_or(api_url);
+        let info_url = format!("{root_url}/model/info");
+        let info_request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(&info_url)
+            .header("Accept", "application/json")
+            .when_some(api_key, |builder, key| {
+                builder.header("Authorization", format!("Bearer {key}"))
+            })
+            .extra_headers(extra_headers)
+            .body(AsyncBody::default())?;
+
+        if let Ok(mut info_response) = client.send(info_request).await {
+            if info_response.status().is_success() {
+                let mut info_body = String::new();
+                if info_response
+                    .body_mut()
+                    .read_to_string(&mut info_body)
+                    .await
+                    .is_ok()
+                {
+                    enrich_models_lite_llm(&mut models, &info_body);
+                }
+            }
+        }
+    }
+
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(models)
 }
 
 impl LanguageModelProviderState for OpenAiCompatibleLanguageModelProvider {
-    type ObservableEntity = State;
+    type ObservableEntity = FetchState;
 
     fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
-        Some(self.state.clone())
+        Some(self.fetch_state.clone())
     }
 }
 
@@ -113,10 +427,7 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
-            .settings
-            .available_models
+        self.merged_models(cx)
             .first()
             .map(|model| self.create_language_model(model.clone()))
     }
@@ -126,17 +437,20 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
-            .settings
-            .available_models
+        self.merged_models(cx)
             .iter()
             .map(|model| self.create_language_model(model.clone()))
             .collect()
     }
 
     fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+        // Authenticated if the API key is set AND either manual models exist
+        // or auto-discovered models were successfully fetched (meaning the
+        // server is reachable and the key works).
+        let has_manual = !self.state.read(cx).settings.available_models.is_empty();
+        let has_fetched = self.fetch_state.read(cx).has_models();
+        let has_key = self.state.read(cx).is_authenticated();
+        has_key && (has_manual || has_fetched)
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
@@ -145,13 +459,17 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.clone();
+        let fetch_state = self.fetch_state.clone();
+        let id: Arc<str> = self.id.0.clone().into();
+        let http_client = self.http_client.clone();
         Some(ProviderSettingsView::SubPage(SubPageProviderSettings::new(
             move |window, cx| {
                 cx.new(|cx| {
-                    ApiCompatibleProviderConfigurationView::new(
+                    OpenAiCompatibleConfigurationView::new(
                         state.clone(),
-                        "OpenAI",
-                        API_KEY_PLACEHOLDER,
+                        fetch_state.clone(),
+                        id.clone(),
+                        http_client.clone(),
                         window,
                         cx,
                     )
@@ -164,6 +482,272 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     fn set_api_key(&self, api_key: Option<String>, cx: &mut App) -> Task<Result<()>> {
         self.state
             .update(cx, |state, cx| state.set_api_key(api_key, cx))
+    }
+}
+
+/// Configuration view for OpenAI-compatible providers. Renders the API
+/// key section, connection status with refresh button (when auto-discover
+/// is enabled), and remove provider button.
+pub struct OpenAiCompatibleConfigurationView {
+    api_key_editor: Entity<InputField>,
+    fetch_state: Entity<FetchState>,
+    state: Entity<State>,
+    id: Arc<str>,
+    http_client: Arc<dyn HttpClient>,
+    load_credentials_task: Option<Task<()>>,
+}
+
+impl OpenAiCompatibleConfigurationView {
+    pub fn new(
+        state: Entity<State>,
+        fetch_state: Entity<FetchState>,
+        id: Arc<str>,
+        http_client: Arc<dyn HttpClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let api_key_editor = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
+
+        cx.observe(&fetch_state, |_, _, cx| cx.notify()).detach();
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+
+        let load_credentials_task = Some(cx.spawn_in(window, {
+            let state = state.clone();
+            async move |this, cx| {
+                let task = state.update(cx, |state, cx| state.authenticate(cx));
+                match task.await {
+                    Ok(()) | Err(AuthenticateError::CredentialsNotFound) => {}
+                    Err(error) => {
+                        log::error!(
+                            "Failed to load OpenAI-compatible provider credentials: {error}"
+                        );
+                    }
+                }
+                this.update(cx, |this, cx| {
+                    this.load_credentials_task = None;
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+
+        Self {
+            api_key_editor,
+            fetch_state,
+            state,
+            id,
+            http_client,
+            load_credentials_task,
+        }
+    }
+
+    fn refresh(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.clone();
+        let fetch_state = self.fetch_state.clone();
+        let id = self.id.clone();
+        let http_client = self.http_client.clone();
+
+        cx.spawn(async move |_, cx| {
+            let auth_task = state.update(cx, |state, cx| state.authenticate(cx));
+            let _ = auth_task.await;
+
+            fetch_state.update(cx, |fetch_state, cx| {
+                fetch_state.refresh(&id, &http_client, &state, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn save_api_key(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
+        if api_key.is_empty() {
+            return;
+        }
+
+        self.api_key_editor
+            .update(cx, |input, cx| input.set_text("", window, cx));
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state
+                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))
+                .await
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.api_key_editor
+            .update(cx, |input, cx| input.set_text("", window, cx));
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state
+                .update(cx, |state, cx| state.set_api_key(None, cx))
+                .await
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn remove_provider(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let id = self.id.clone();
+        let fs = <dyn fs::Fs>::global(cx);
+        settings::update_settings_file(fs, cx, move |settings, _| {
+            let Some(language_models) = settings.language_models.as_mut() else {
+                return;
+            };
+            if let Some(providers) = language_models.openai_compatible.as_mut() {
+                providers.remove(id.as_ref());
+            }
+        });
+    }
+
+    fn should_render_editor(&self, cx: &Context<Self>) -> bool {
+        !self.state.read(cx).is_authenticated()
+    }
+}
+
+impl Render for OpenAiCompatibleConfigurationView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.load_credentials_task.is_some() {
+            return div().child(Label::new("Loading credentials…")).into_any();
+        }
+
+        let state = self.state.read(cx);
+        let env_var_set = state.api_key_state.is_from_env_var();
+        let env_var_name = state.api_key_state.env_var_name();
+        let auto_discover = state.settings.auto_discover;
+        let has_models = self.fetch_state.read(cx).has_models();
+
+        let api_key_section = if self.should_render_editor(cx) {
+            v_flex()
+                .on_action(cx.listener(Self::save_api_key))
+                .child(Label::new(
+                    "To use Zed's agent with an OpenAI-compatible provider, you need to add an API key.",
+                ))
+                .child(
+                    div()
+                        .pt(DynamicSpacing::Base04.rems(cx))
+                        .child(self.api_key_editor.clone()),
+                )
+                .child(
+                    Label::new(format!(
+                        "You can also set the {env_var_name} environment variable and restart Zed.",
+                    ))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any()
+        } else {
+            h_flex()
+                .mt_1()
+                .p_1()
+                .justify_between()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().background)
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(Icon::new(IconName::Check).color(Color::Success))
+                        .child(
+                            div().w_full().overflow_x_hidden().text_ellipsis().child(Label::new(
+                                if env_var_set {
+                                    format!("API key set in {env_var_name} environment variable")
+                                } else {
+                                    format!("API key configured for {}", state.settings.api_url())
+                                },
+                            )),
+                        ),
+                )
+                .child(
+                    h_flex().flex_shrink_0().child(
+                        Button::new("reset-api-key", "Reset API Key")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
+                            .layer(ElevationIndex::ModalSurface)
+                            .when(env_var_set, |this| {
+                                this.tooltip(Tooltip::text(format!(
+                                    "To reset your API key, unset the {env_var_name} environment variable.",
+                                )))
+                            })
+
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_api_key(window, cx)
+                            })),
+                    ),
+                )
+                .into_any()
+        };
+
+        v_flex()
+            .size_full()
+            .gap_4()
+            .child(api_key_section)
+            .when(auto_discover, |this| {
+                this.child(
+                    h_flex().w_full().justify_end().child(
+                        h_flex()
+                            .gap_1()
+                            .when(has_models, |this| {
+                                this.child(
+                                    ButtonLike::new("connected")
+                                        .size(ButtonSize::Compact)
+                                        .child(
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Icon::new(IconName::Check)
+                                                        .color(Color::Success),
+                                                )
+                                                .child(Label::new("Connected")),
+                                        )
+                                        .child(
+                                            IconButton::new("refresh-models", IconName::RotateCcw)
+                                                .icon_size(IconSize::Small)
+                                                .tooltip(Tooltip::text("Refresh Models"))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.refresh(window, cx);
+                                                })),
+                                        ),
+                                )
+                            })
+                            .when(!has_models, |this| {
+                                this.child(
+                                    Button::new("connect", "Connect")
+                                        .style(ButtonStyle::Outlined)
+                                        .size(ButtonSize::Compact)
+                                        .start_icon(
+                                            Icon::new(IconName::PlayOutlined)
+                                                .size(IconSize::XSmall),
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.refresh(window, cx);
+                                        })),
+                                )
+                            }),
+                    ),
+                )
+            })
+            .child(
+                h_flex().w_full().justify_end().child(
+                    Button::new("remove-compatible-provider", "Remove Provider")
+                        .style(ButtonStyle::OutlinedGhost)
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(IconName::Trash)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.remove_provider(window, cx)),
+                        ),
+                ),
+            )
+            .into_any()
     }
 }
 
@@ -733,5 +1317,89 @@ mod tests {
         disable_response_thinking_for_none_effort(&mut request, &model);
         assert!(!request.thinking_allowed);
         assert_eq!(request.thinking_effort, None);
+    }
+
+    fn default_discovered_model(name: &str) -> AvailableModel {
+        AvailableModel {
+            name: name.to_string(),
+            display_name: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+            capabilities: ModelCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn test_enrich_models_lite_llm_enriches_capabilities() {
+        let mut models = vec![default_discovered_model("gpt-4")];
+        let body = json!({
+            "data": [{
+                "model_name": "gpt-4",
+                "model_info": {
+                    "max_input_tokens": 200_000,
+                    "max_output_tokens": 16_384,
+                    "supports_function_calling": false,
+                    "supports_vision": true,
+                    "supports_prompt_caching": true,
+                    "supports_reasoning": true
+                }
+            }]
+        })
+        .to_string();
+
+        enrich_models_lite_llm(&mut models, &body);
+
+        let model = &models[0];
+        assert_eq!(model.max_tokens, 200_000);
+        assert_eq!(model.max_output_tokens, Some(16_384));
+        assert!(!model.capabilities.tools);
+        assert!(model.capabilities.images);
+        assert!(model.capabilities.prompt_cache_key);
+        assert_eq!(model.reasoning_effort, Some(OpenAiReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn test_enrich_models_lite_llm_falls_back_to_max_tokens() {
+        let mut models = vec![default_discovered_model("claude-3")];
+        let body = json!({
+            "data": [{
+                "model_name": "claude-3",
+                "model_info": {
+                    "max_tokens": 4096
+                }
+            }]
+        })
+        .to_string();
+
+        enrich_models_lite_llm(&mut models, &body);
+
+        assert_eq!(models[0].max_tokens, 4096);
+        assert_eq!(models[0].max_output_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_enrich_models_lite_llm_keeps_defaults_for_unmatched_models() {
+        let mut models = vec![default_discovered_model("unknown-model")];
+        let body = json!({
+            "data": [{
+                "model_name": "different-model",
+                "model_info": { "max_input_tokens": 999_999 }
+            }]
+        })
+        .to_string();
+
+        enrich_models_lite_llm(&mut models, &body);
+
+        assert_eq!(models[0].max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(models[0].max_output_tokens, None);
+    }
+
+    #[test]
+    fn test_enrich_models_lite_llm_handles_invalid_json() {
+        let mut models = vec![default_discovered_model("gpt-4")];
+        enrich_models_lite_llm(&mut models, "not valid json");
+        assert_eq!(models[0].max_tokens, DEFAULT_MAX_TOKENS);
     }
 }
