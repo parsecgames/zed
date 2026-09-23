@@ -1170,3 +1170,6 @@ nonminimal_bool = "allow"
 # this workspace on purpose.
 [workspace.metadata.dylint]
 libraries = [{ path = "tooling/lints" }]
+
+[profile.release]
+strip="debuginfo"
