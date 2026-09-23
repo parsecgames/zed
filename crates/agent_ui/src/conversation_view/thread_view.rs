@@ -10691,7 +10691,10 @@ impl ThreadView {
             .and_then(|thread| {
                 let thread = thread.read(cx);
                 let model = thread.model()?;
-                Some(model.name().0)
+                Some(language_model::format_model_identifier(
+                    &model.provider_name().0,
+                    &model.name().0,
+                ))
             });
         let thread_title = thread
             .as_ref()
@@ -11503,14 +11506,17 @@ impl ThreadView {
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
-        // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
+        // For native agent (Zed Agent), use the formatted model identifier
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
-        // This provides better clarity about what refused the request
         if self.as_native_connection(cx).is_some() {
             self.model_selector
                 .clone()
-                .and_then(|selector| selector.read(cx).active_model(cx))
-                .map(|model| model.name.clone())
+                .and_then(|selector| {
+                    selector
+                        .read(cx)
+                        .active_model(cx)
+                        .map(|model| model.name.clone())
+                })
                 .unwrap_or_else(|| SharedString::from("The model"))
         } else {
             // ACP agent - use the agent name (e.g., "Claude Agent", "Gemini CLI")

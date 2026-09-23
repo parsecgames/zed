@@ -3261,8 +3261,12 @@ impl ConversationView {
         if self.as_native_connection(cx).is_some() {
             self.root_thread_view()
                 .and_then(|active| active.read(cx).model_selector.clone())
-                .and_then(|selector| selector.read(cx).active_model(cx))
-                .map(|model| model.name.clone())
+                .and_then(|selector| {
+                    selector
+                        .read(cx)
+                        .active_model(cx)
+                        .map(|model| model.name.clone())
+                })
                 .unwrap_or_else(|| SharedString::from("The model"))
         } else {
             // ACP agent - use the agent name (e.g., "Claude Agent", "Gemini CLI")

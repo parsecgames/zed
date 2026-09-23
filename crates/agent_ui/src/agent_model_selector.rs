@@ -90,7 +90,13 @@ impl Render for AgentModelSelector {
         let model = self.selector.read(cx).delegate.active_model(cx);
         let model_name = model
             .as_ref()
-            .map(|model| model.model.name().0)
+            .map(|model| {
+                language_model::format_model_identifier(
+                    &model.provider.name().0,
+                    &model.model.name().0,
+                )
+            })
+            .map(SharedString::from)
             .unwrap_or_else(|| SharedString::from("Select a Model"));
 
         let provider_icon = model.as_ref().map(|model| model.provider.icon());

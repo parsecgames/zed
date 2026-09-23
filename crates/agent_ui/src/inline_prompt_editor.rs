@@ -1026,7 +1026,9 @@ impl<T: 'static> PromptEditor<T> {
         let alternative_models = model_registry.inline_alternative_models();
 
         let get_model_name = |index: usize| -> String {
-            let name = |model: &Arc<dyn LanguageModel>| model.name().0.to_string();
+            let name = |model: &Arc<dyn LanguageModel>| {
+                language_model::format_model_identifier(&model.provider_name().0, &model.name().0)
+            };
 
             match index {
                 0 => default_model.as_ref().map_or_else(String::new, name),
