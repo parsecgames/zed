@@ -248,6 +248,78 @@ struct ModelEntry {
     id: String,
 }
 
+// ── Model info: llama.cpp router /v1/models ────────────────────────────────
+
+/// Response from llama.cpp router's `GET /v1/models` endpoint.
+#[derive(Deserialize)]
+struct LlamaCppModelsResponse {
+    #[serde(default)]
+    data: Vec<LlamaCppModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct LlamaCppModelEntry {
+    id: String,
+    #[serde(default)]
+    architecture: Option<LlamaCppArchitecture>,
+    #[serde(default)]
+    meta: Option<LlamaCppModelMeta>,
+}
+
+#[derive(Default, Deserialize)]
+struct LlamaCppArchitecture {
+    #[serde(default)]
+    input_modalities: Vec<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct LlamaCppModelMeta {
+    #[serde(default)]
+    n_ctx: Option<u64>,
+}
+
+/// Parse llama.cpp router /v1/models response into AvailableModels.
+/// Extracts capabilities from the rich response format.
+fn parse_llamacpp_models(body: &str) -> Result<Vec<AvailableModel>> {
+    let response: LlamaCppModelsResponse =
+        serde_json::from_str(body).context("Unable to parse llama.cpp models response")?;
+
+    let mut models = Vec::new();
+    for entry in response.data {
+        let supports_images = entry
+            .architecture
+            .as_ref()
+            .map(|arch| arch.input_modalities.iter().any(|m| m == "image"))
+            .unwrap_or(false);
+
+        let max_tokens = entry
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.n_ctx)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+
+        models.push(AvailableModel {
+            name: entry.id.clone(),
+            display_name: None,
+            max_tokens,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+            capabilities: ModelCapabilities {
+                tools: true,
+                images: supports_images,
+                parallel_tool_calls: false,
+                prompt_cache_key: false,
+                chat_completions: true,
+                interleaved_reasoning: false,
+                max_tokens_parameter: false,
+            },
+        });
+    }
+
+    Ok(models)
+}
+
 // ── Model info: LiteLLM /model/info ────────────────────────────────────────
 
 /// Response of LiteLLM's `GET /v1/model/info` endpoint.
@@ -370,6 +442,11 @@ async fn fetch_models(
                 max_tokens_parameter: false,
             },
         });
+    }
+
+    if auto_discover_mode == AutoDiscoverMode::LlamaCpp {
+        // llama.cpp router provides capabilities directly in /v1/models response
+        return parse_llamacpp_models(&body);
     }
 
     if auto_discover_mode == AutoDiscoverMode::LiteLlm {

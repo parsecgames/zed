@@ -402,12 +402,15 @@ impl MergeFrom for OpenAiReasoningEffort {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[derive(
+    Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAiCompatibleAutoDiscoverMode {
     #[default]
     None,
     LiteLlm,
+    LlamaCpp,
 }
 
 #[with_fallible_options]

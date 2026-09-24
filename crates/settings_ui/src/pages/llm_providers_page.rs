@@ -1067,6 +1067,7 @@ fn render_auto_discover_mode_selector(
         for option in [
             (OpenAiCompatibleAutoDiscoverMode::None, "Default"),
             (OpenAiCompatibleAutoDiscoverMode::LiteLlm, "LiteLLM"),
+            (OpenAiCompatibleAutoDiscoverMode::LlamaCpp, "llama.cpp"),
         ] {
             let (mode, label) = option;
             let is_selected = mode == selected;
@@ -1092,6 +1093,7 @@ fn render_auto_discover_mode_selector(
     let label = match selected {
         OpenAiCompatibleAutoDiscoverMode::None => "Default",
         OpenAiCompatibleAutoDiscoverMode::LiteLlm => "LiteLLM",
+        OpenAiCompatibleAutoDiscoverMode::LlamaCpp => "llama.cpp",
     };
 
     DropdownMenu::new(
@@ -1238,9 +1240,8 @@ fn save_llm_provider_form(
                                     OpenAiCompatibleSettingsContent {
                                         api_url: api_url.clone(),
                                         auto_discover: auto_discover.then_some(true),
-                                        auto_discover_mode: auto_discover.then_some(
-                                            auto_discover_mode,
-                                        ),
+                                        auto_discover_mode: auto_discover
+                                            .then_some(auto_discover_mode),
                                         available_models,
                                         custom_headers: None,
                                     },
