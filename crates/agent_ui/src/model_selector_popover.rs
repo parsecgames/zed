@@ -49,7 +49,16 @@ impl Render for ModelSelectorPopover {
         let model = selector.delegate.active_model();
         let model_name = model
             .as_ref()
-            .map(|model| model.name.clone())
+            .map(|model| {
+                model
+                    .provider_name
+                    .as_ref()
+                    .map(|provider_name| {
+                        language_model::format_model_identifier(provider_name, &model.name)
+                    })
+                    .unwrap_or_else(|| model.name.to_string())
+            })
+            .map(SharedString::from)
             .unwrap_or_else(|| SharedString::from("Select a Model"));
 
         let model_icon = model.as_ref().and_then(|model| model.icon.clone());

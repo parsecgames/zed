@@ -583,6 +583,11 @@ pub enum AgentModelIcon {
 pub struct AgentModelInfo {
     pub id: AgentModelId,
     pub name: SharedString,
+    /// The provider this model belongs to, if known.
+    /// Used to prefix the model name for display when the provider
+    /// context is not otherwise visible (e.g. the collapsed model
+    /// selector button).
+    pub provider_name: Option<SharedString>,
     pub description: Option<SharedString>,
     pub icon: Option<AgentModelIcon>,
     pub is_latest: bool,
@@ -1363,6 +1368,7 @@ mod test_support {
                 selected_model: Arc::new(Mutex::new(AgentModelInfo {
                     id: AgentModelId::new("visual-test-model"),
                     name: "Visual Test Model".into(),
+                    provider_name: None,
                     description: Some("A stub model for visual testing".into()),
                     icon: Some(AgentModelIcon::Named(ui::IconName::ZedAssistant)),
                     is_latest: false,

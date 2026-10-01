@@ -28,6 +28,30 @@ pub fn init(cx: &mut App) {
     registry::init(cx);
 }
 
+/// Generate a 3-letter abbreviation from a provider name.
+/// Generate a 3-letter abbreviation from a provider name.
+/// Uses the first 3 characters, uppercased.
+fn provider_abbreviation(name: &str) -> String {
+    name.chars()
+        .take(3)
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Format a model identifier for display as "{provider_abbrev}/{model_name}".
+/// Long model names (> 50 chars) are truncated to first 25 + "..." + last 25.
+pub fn format_model_identifier(provider_name: &str, model_name: &str) -> String {
+    let abbrev = provider_abbreviation(provider_name);
+    let display = if model_name.len() > 50 {
+        let first = &model_name[..25];
+        let last = &model_name[model_name.len() - 25..];
+        format!("{}...{}", first, last)
+    } else {
+        model_name.to_string()
+    };
+    format!("{}/{}", abbrev, display)
+}
+
 pub fn stream_in_background<Output>(
     mut events: BoxStream<'static, Output>,
     executor: BackgroundExecutor,

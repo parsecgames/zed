@@ -508,6 +508,7 @@ mod tests {
                         .map(|model| acp_thread::AgentModelInfo {
                             id: AgentModelId::new(model),
                             name: model.to_string().into(),
+                            provider_name: None,
                             description: None,
                             icon: None,
                             is_latest: false,
@@ -616,6 +617,7 @@ mod tests {
                 AgentModelInfo {
                     id: AgentModelId::new("auto"),
                     name: "Auto".into(),
+                    provider_name: None,
                     description: None,
                     icon: None,
                     is_latest: false,
@@ -625,6 +627,7 @@ mod tests {
                 AgentModelInfo {
                     id: AgentModelId::new("manual"),
                     name: "Manual".into(),
+                    provider_name: None,
                     description: None,
                     icon: None,
                     is_latest: false,
@@ -810,6 +813,7 @@ mod tests {
             acp_thread::AgentModelInfo {
                 id: AgentModelId::new("zed/claude"),
                 name: "Claude".into(),
+                provider_name: None,
                 description: None,
                 icon: None,
                 is_latest: false,
@@ -819,6 +823,7 @@ mod tests {
             acp_thread::AgentModelInfo {
                 id: AgentModelId::new("zed/gemini"),
                 name: "Gemini".into(),
+                provider_name: None,
                 description: None,
                 icon: None,
                 is_latest: false,
@@ -862,6 +867,7 @@ mod tests {
             acp_thread::AgentModelInfo {
                 id: AgentModelId::new("favorite-model"),
                 name: "Favorite".into(),
+                provider_name: None,
                 description: None,
                 icon: None,
                 is_latest: false,
@@ -871,6 +877,7 @@ mod tests {
             acp_thread::AgentModelInfo {
                 id: AgentModelId::new("regular-model"),
                 name: "Regular".into(),
+                provider_name: None,
                 description: None,
                 icon: None,
                 is_latest: false,
