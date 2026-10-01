@@ -1,0 +1,287 @@
+From 37cd1dc98adcd8142d8c6d7a26c86b46d26d22b1 Mon Sep 17 00:00:00 2001
+From: Parsec Games <author@parsecgames.com>
+Date: Mon, 28 Sep 2026 21:29:54 -0500
+Subject: [PATCH] model name abbreviated
+
+---
+ crates/acp_thread/src/connection.rs           |  6 +++++
+ crates/agent/src/agent.rs                     |  2 ++
+ crates/agent_ui/src/agent_model_selector.rs   |  5 +++-
+ crates/agent_ui/src/conversation_view.rs      |  8 +++++--
+ .../src/conversation_view/thread_view.rs      | 16 +++++++++----
+ crates/agent_ui/src/inline_prompt_editor.rs   |  4 +++-
+ .../agent_ui/src/language_model_selector.rs   |  6 ++++-
+ crates/agent_ui/src/model_selector.rs         |  7 ++++++
+ crates/agent_ui/src/model_selector_popover.rs | 11 ++++++++-
+ crates/language_model/src/language_model.rs   | 24 +++++++++++++++++++
+ 10 files changed, 78 insertions(+), 11 deletions(-)
+
+diff --git a/crates/acp_thread/src/connection.rs b/crates/acp_thread/src/connection.rs
+index 11d3edf436..538768a492 100644
+--- a/crates/acp_thread/src/connection.rs
++++ b/crates/acp_thread/src/connection.rs
+@@ -515,6 +515,11 @@ pub enum AgentModelIcon {
+ pub struct AgentModelInfo {
+     pub id: AgentModelId,
+     pub name: SharedString,
++    /// The provider this model belongs to, if known.
++    /// Used to prefix the model name for display when the provider
++    /// context is not otherwise visible (e.g. the collapsed model
++    /// selector button).
++    pub provider_name: Option<SharedString>,
+     pub description: Option<SharedString>,
+     pub icon: Option<AgentModelIcon>,
+     pub is_latest: bool,
+@@ -1130,6 +1135,7 @@ mod test_support {
+                 selected_model: Arc::new(Mutex::new(AgentModelInfo {
+                     id: AgentModelId::new("visual-test-model"),
+                     name: "Visual Test Model".into(),
++                    provider_name: None,
+                     description: Some("A stub model for visual testing".into()),
+                     icon: Some(AgentModelIcon::Named(ui::IconName::ZedAssistant)),
+                     is_latest: false,
+diff --git a/crates/agent/src/agent.rs b/crates/agent/src/agent.rs
+index 1a961c4679..9ee653b15b 100644
+--- a/crates/agent/src/agent.rs
++++ b/crates/agent/src/agent.rs
+@@ -343,6 +343,7 @@ impl LanguageModels {
+         acp_thread::AgentModelInfo {
+             id: Self::model_id(model),
+             name: model.name().0,
++            provider_name: Some(provider.name().0),
+             description: None,
+             icon: Some(match provider.icon() {
+                 IconOrSvg::Svg(path) => acp_thread::AgentModelIcon::Path(path),
+@@ -6570,6 +6571,7 @@ mod internal_tests {
+                 vec![AgentModelInfo {
+                     id: AgentModelId::new("fake/fake"),
+                     name: "Fake".into(),
++                    provider_name: Some("Fake".into()),
+                     description: None,
+                     icon: Some(acp_thread::AgentModelIcon::Named(
+                         ui::IconName::ZedAssistant
+diff --git a/crates/agent_ui/src/agent_model_selector.rs b/crates/agent_ui/src/agent_model_selector.rs
+index 89eeccc1e3..7ee96a335f 100644
+--- a/crates/agent_ui/src/agent_model_selector.rs
++++ b/crates/agent_ui/src/agent_model_selector.rs
+@@ -90,7 +90,10 @@ impl Render for AgentModelSelector {
+         let model = self.selector.read(cx).delegate.active_model(cx);
+         let model_name = model
+             .as_ref()
+-            .map(|model| model.name().0)
++            .map(|model| {
++                language_model::format_model_identifier(&model.provider_name().0, &model.name().0)
++            })
++            .map(SharedString::from)
+             .unwrap_or_else(|| SharedString::from("Select a Model"));
+
+         let provider_icon = model.as_ref().and_then(|model| {
+diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
+index 139ce41875..0dc62127f5 100644
+--- a/crates/agent_ui/src/conversation_view.rs
++++ b/crates/agent_ui/src/conversation_view.rs
+@@ -3265,8 +3265,12 @@ impl ConversationView {
+         if self.as_native_connection(cx).is_some() {
+             self.root_thread_view()
+                 .and_then(|active| active.read(cx).model_selector.clone())
+-                .and_then(|selector| selector.read(cx).active_model(cx))
+-                .map(|model| model.name.clone())
++                .and_then(|selector| {
++                    selector
++                        .read(cx)
++                        .active_model(cx)
++                        .map(|model| model.name.clone())
++                })
+                 .unwrap_or_else(|| SharedString::from("The model"))
+         } else {
+             // ACP agent - use the agent name (e.g., "Claude Agent", "Gemini CLI")
+diff --git a/crates/agent_ui/src/conversation_view/thread_view.rs b/crates/agent_ui/src/conversation_view/thread_view.rs
+index ae4ebc2a68..27e2aa56ad 100644
+--- a/crates/agent_ui/src/conversation_view/thread_view.rs
++++ b/crates/agent_ui/src/conversation_view/thread_view.rs
+@@ -10732,7 +10732,10 @@ impl ThreadView {
+             .and_then(|thread| {
+                 let thread = thread.read(cx);
+                 let model = thread.model()?;
+-                Some(model.name().0)
++                Some(language_model::format_model_identifier(
++                    &model.provider_name().0,
++                    &model.name().0,
++                ))
+             });
+         let thread_title = thread
+             .as_ref()
+@@ -11544,14 +11547,17 @@ impl ThreadView {
+     }
+
+     fn current_model_name(&self, cx: &App) -> SharedString {
+-        // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
++        // For native agent (Zed Agent), use the formatted model identifier
+         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
+-        // This provides better clarity about what refused the request
+         if self.as_native_connection(cx).is_some() {
+             self.model_selector
+                 .clone()
+-                .and_then(|selector| selector.read(cx).active_model(cx))
+-                .map(|model| model.name.clone())
++                .and_then(|selector| {
++                    selector
++                        .read(cx)
++                        .active_model(cx)
++                        .map(|model| model.name.clone())
++                })
+                 .unwrap_or_else(|| SharedString::from("The model"))
+         } else {
+             // ACP agent - use the agent name (e.g., "Claude Agent", "Gemini CLI")
+diff --git a/crates/agent_ui/src/inline_prompt_editor.rs b/crates/agent_ui/src/inline_prompt_editor.rs
+index 3d5baa652f..3efa5c34f9 100644
+--- a/crates/agent_ui/src/inline_prompt_editor.rs
++++ b/crates/agent_ui/src/inline_prompt_editor.rs
+@@ -1020,7 +1020,9 @@ impl<T: 'static> PromptEditor<T> {
+         let alternative_models = model_registry.inline_alternative_models();
+
+         let get_model_name = |index: usize| -> String {
+-            let name = |model: &LanguageModel| model.name.0.to_string();
++            let name = |model: &LanguageModel| {
++                language_model::format_model_identifier(&model.provider_name().0, &model.name().0)
++            };
+
+             match index {
+                 0 => default_model.as_ref().map_or_else(String::new, name),
+diff --git a/crates/agent_ui/src/language_model_selector.rs b/crates/agent_ui/src/language_model_selector.rs
+index ba60f9c2db..0a9a7613f9 100644
+--- a/crates/agent_ui/src/language_model_selector.rs
++++ b/crates/agent_ui/src/language_model_selector.rs
+@@ -529,8 +529,12 @@ impl PickerDelegate for LanguageModelPickerDelegate {
+                     })
+                 };
+
++                let display_name = language_model::format_model_identifier(
++                    &model_info.model.provider_name().0,
++                    &model_info.model.name().0,
++                );
+                 Some(
+-                    ModelSelectorListItem::new(ix, model_info.model.name().0)
++                    ModelSelectorListItem::new(ix, display_name)
+                         .map(|this| match &model_info.icon {
+                             IconOrSvg::Icon(icon_name) => this.icon(*icon_name),
+                             IconOrSvg::Svg(icon_path) => this.icon_path(icon_path.clone()),
+diff --git a/crates/agent_ui/src/model_selector.rs b/crates/agent_ui/src/model_selector.rs
+index d177f0adc4..8129752887 100644
+--- a/crates/agent_ui/src/model_selector.rs
++++ b/crates/agent_ui/src/model_selector.rs
+@@ -508,6 +508,7 @@ mod tests {
+                         .map(|model| acp_thread::AgentModelInfo {
+                             id: AgentModelId::new(model),
+                             name: model.to_string().into(),
++                            provider_name: None,
+                             description: None,
+                             icon: None,
+                             is_latest: false,
+@@ -616,6 +617,7 @@ mod tests {
+                 AgentModelInfo {
+                     id: AgentModelId::new("auto"),
+                     name: "Auto".into(),
++                    provider_name: None,
+                     description: None,
+                     icon: None,
+                     is_latest: false,
+@@ -625,6 +627,7 @@ mod tests {
+                 AgentModelInfo {
+                     id: AgentModelId::new("manual"),
+                     name: "Manual".into(),
++                    provider_name: None,
+                     description: None,
+                     icon: None,
+                     is_latest: false,
+@@ -810,6 +813,7 @@ mod tests {
+             acp_thread::AgentModelInfo {
+                 id: AgentModelId::new("zed/claude"),
+                 name: "Claude".into(),
++                provider_name: None,
+                 description: None,
+                 icon: None,
+                 is_latest: false,
+@@ -819,6 +823,7 @@ mod tests {
+             acp_thread::AgentModelInfo {
+                 id: AgentModelId::new("zed/gemini"),
+                 name: "Gemini".into(),
++                provider_name: None,
+                 description: None,
+                 icon: None,
+                 is_latest: false,
+@@ -862,6 +867,7 @@ mod tests {
+             acp_thread::AgentModelInfo {
+                 id: AgentModelId::new("favorite-model"),
+                 name: "Favorite".into(),
++                provider_name: None,
+                 description: None,
+                 icon: None,
+                 is_latest: false,
+@@ -871,6 +877,7 @@ mod tests {
+             acp_thread::AgentModelInfo {
+                 id: AgentModelId::new("regular-model"),
+                 name: "Regular".into(),
++                provider_name: None,
+                 description: None,
+                 icon: None,
+                 is_latest: false,
+diff --git a/crates/agent_ui/src/model_selector_popover.rs b/crates/agent_ui/src/model_selector_popover.rs
+index f7771ba9a7..90bf657daf 100644
+--- a/crates/agent_ui/src/model_selector_popover.rs
++++ b/crates/agent_ui/src/model_selector_popover.rs
+@@ -49,7 +49,16 @@ impl Render for ModelSelectorPopover {
+         let model = selector.delegate.active_model();
+         let model_name = model
+             .as_ref()
+-            .map(|model| model.name.clone())
++            .map(|model| {
++                model
++                    .provider_name
++                    .as_ref()
++                    .map(|provider_name| {
++                        language_model::format_model_identifier(provider_name, &model.name)
++                    })
++                    .unwrap_or_else(|| model.name.to_string())
++            })
++            .map(SharedString::from)
+             .unwrap_or_else(|| SharedString::from("Select a Model"));
+
+         let model_icon = model.as_ref().and_then(|model| model.icon.clone());
+diff --git a/crates/language_model/src/language_model.rs b/crates/language_model/src/language_model.rs
+index 62e0675343..f03fd6caf6 100644
+--- a/crates/language_model/src/language_model.rs
++++ b/crates/language_model/src/language_model.rs
+@@ -28,6 +28,30 @@ pub fn init(cx: &mut App) {
+     registry::init(cx);
+ }
+
++/// Generate a 3-letter abbreviation from a provider name.
++/// Generate a 3-letter abbreviation from a provider name.
++/// Uses the first 3 characters, uppercased.
++fn provider_abbreviation(name: &str) -> String {
++    name.chars()
++        .take(3)
++        .map(|c| c.to_ascii_uppercase())
++        .collect()
++}
++
++/// Format a model identifier for display as "{provider_abbrev}/{model_name}".
++/// Long model names (> 50 chars) are truncated to first 25 + "..." + last 25.
++pub fn format_model_identifier(provider_name: &str, model_name: &str) -> String {
++    let abbrev = provider_abbreviation(provider_name);
++    let display = if model_name.len() > 50 {
++        let first = &model_name[..25];
++        let last = &model_name[model_name.len() - 25..];
++        format!("{}...{}", first, last)
++    } else {
++        model_name.to_string()
++    };
++    format!("{}/{}", abbrev, display)
++}
++
+ pub fn stream_in_background<Output>(
+     mut events: BoxStream<'static, Output>,
+     executor: BackgroundExecutor,
+--
+2.47.3
