@@ -181,6 +181,8 @@ impl settings::Settings for AllLanguageModelSettings {
                         key,
                         OpenAiCompatibleSettings {
                             api_url: value.api_url,
+                            auto_discover: value.auto_discover.unwrap_or(false),
+                            auto_discover_mode: value.auto_discover_mode.unwrap_or_default(),
                             available_models: value.available_models,
                             custom_headers: custom_headers_from(
                                 &provider_label,
